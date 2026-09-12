@@ -2580,6 +2580,8 @@ footer > * { max-width: 720px; margin-left: auto; margin-right: auto; }
   padding: 0.875rem 1.25rem;
   border-top: 1px solid rgba(15, 23, 42, 0.08);
 }
+.backup-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.backup-warning { font-size: 0.8rem; color: var(--gray-500); margin: 0.75rem 0 0; }
 .modal-btn-primary, .modal-btn-secondary {
   padding: 0.625rem 1.125rem;
   border-radius: 999px;
@@ -4409,9 +4411,36 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
   <button class="app-team-link app-team-link-danger" id="appDeleteTeamBtn">
     <i class="fa-solid fa-trash" aria-hidden="true"></i> Delete Team
   </button>
+  <button class="app-team-link" id="appBackupBtn">
+    <i class="fa-solid fa-database" aria-hidden="true"></i> Backup
+  </button>
   <a class="app-team-link" href="?manager">
     <i class="fa-solid fa-bars" aria-hidden="true"></i> Team Manager
   </a>
+</div>
+
+<!-- ============ Backup / restore modal ============ -->
+<div class="modal-overlay" id="backupOverlay" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="backupTitle">
+    <div class="modal-header">
+      <h3 id="backupTitle">Backup &amp; Restore</h3>
+      <button class="modal-close" id="backupCloseBtn" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="switch-game-hint" id="backupSummary"></p>
+      <div class="backup-actions">
+        <button class="modal-btn-primary" id="backupExportBtn" type="button">Export backup</button>
+        <button class="modal-btn-secondary" id="backupImportBtn" type="button">Restore from file</button>
+      </div>
+      <input type="file" id="backupFileInput" accept="application/json,.json" class="hidden-input">
+      <label class="tm-field">
+        <span class="tm-field-label">Or paste backup text</span>
+        <textarea id="backupPasteInput" rows="4" placeholder="Paste the contents of a backup file here…"></textarea>
+      </label>
+      <button class="modal-btn-secondary" id="backupPasteBtn" type="button">Restore from pasted text</button>
+      <p class="backup-warning">Restoring replaces this device's teams, games and scores with the backup.</p>
+    </div>
+  </div>
 </div>
 
 <div class="sponsor-strip-wrap" id="sponsorStripWrap">
@@ -6226,6 +6255,112 @@ function bindBaseballCardUi() {
     if (!t) return;
     e.stopPropagation();
     openBaseballCard(t.dataset.cardPlayer);
+  });
+}
+
+/* ============ Backup / restore ============
+   localStorage is per-origin, so this file is the only way to move a
+   team between URLs — and the only copy that survives if the cloud
+   basket disappears. */
+function collectBackup() {
+  const out = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && shouldSyncKey(k)) out[k] = localStorage.getItem(k);
+  }
+  return out;
+}
+function backupSummaryText() {
+  let teams = [];
+  try { teams = JSON.parse(localStorage.getItem('tm_teams') || '[]') || []; } catch (e) {}
+  let games = 0;
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (!k || !/cardinals_games_v1$/.test(k)) continue;
+    try { games += (JSON.parse(localStorage.getItem(k)) || []).length; } catch (e) {}
+  }
+  return `${teams.length} team${teams.length === 1 ? '' : 's'} and ${games} game${games === 1 ? '' : 's'} on this device.`;
+}
+async function exportBackup() {
+  const text = JSON.stringify({
+    app: 'team-manager',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    keys: collectBackup()
+  }, null, 2);
+  const filename = `team-manager-backup-${todayKey()}.json`;
+  const blob = new Blob([text], { type: 'application/json' });
+  const file = new File([blob], filename, { type: 'application/json' });
+  // Share sheet first: on iOS a plain download link is unreliable.
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: filename });
+      showBubble('Backup saved 💾');
+      return;
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  showBubble('Backup saved 💾');
+}
+function restoreBackup(text) {
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (e) {}
+  const keys = parsed && parsed.keys;
+  if (!parsed || parsed.app !== 'team-manager' || !keys || typeof keys !== 'object' || !Object.keys(keys).length) {
+    alert("That doesn't look like a Team Manager backup.");
+    return;
+  }
+  const count = Object.keys(keys).length;
+  if (!confirm(`Restore ${count} saved items? This replaces the teams, games and scores already on this device.`)) return;
+  // Clean replace, not a merge — a half-merged roster is worse than either.
+  const stale = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && shouldSyncKey(k)) stale.push(k);
+  }
+  // Raw writes: a per-key push storm during restore would be pointless.
+  stale.forEach(k => _rawRemove(k));
+  Object.keys(keys).forEach(k => {
+    if (shouldSyncKey(k) && typeof keys[k] === 'string') _rawSet(k, keys[k]);
+  });
+  location.reload();
+}
+function bindBackupUi() {
+  const overlay = document.getElementById('backupOverlay');
+  const openBtn = document.getElementById('appBackupBtn');
+  if (!overlay || !openBtn) return;
+  const close = () => { overlay.hidden = true; };
+  openBtn.addEventListener('click', () => {
+    document.getElementById('backupSummary').textContent = backupSummaryText();
+    document.getElementById('backupPasteInput').value = '';
+    overlay.hidden = false;
+  });
+  document.getElementById('backupCloseBtn')?.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  document.getElementById('backupExportBtn')?.addEventListener('click', exportBackup);
+  document.getElementById('backupImportBtn')?.addEventListener('click', () => {
+    document.getElementById('backupFileInput').click();
+  });
+  document.getElementById('backupFileInput')?.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => restoreBackup(String(reader.result));
+    reader.readAsText(file);
+    e.target.value = '';
+  });
+  document.getElementById('backupPasteBtn')?.addEventListener('click', () => {
+    const text = document.getElementById('backupPasteInput').value.trim();
+    if (text) restoreBackup(text);
   });
 }
 
@@ -8316,6 +8451,7 @@ bindBattingDrag();
 bindFieldingDrag();
 bindScheduleUi();
 bindBaseballCardUi();
+bindBackupUi();
 bindScoreRefresh();
 renderSchedule();
 renderCurrentGameBanner();
