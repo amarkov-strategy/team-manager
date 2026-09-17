@@ -797,6 +797,26 @@ header::before {
   .brand-text h1 { letter-spacing: 0.08em; }
 }
 
+.sync-alert {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  top: max(0.5rem, env(safe-area-inset-top));
+  z-index: 300;
+  max-width: min(94vw, 460px);
+  background: #8B0000;
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 800;
+  line-height: 1.25;
+  padding: 0.55rem 0.9rem;
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+  text-align: center;
+  cursor: pointer;
+}
+.sync-alert[hidden] { display: none !important; }
+
 /* Quote bubble */
 .coach-bubble {
   position: fixed;
@@ -4233,6 +4253,7 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
 </header>
 
 <div class="coach-bubble" id="coachBubble"></div>
+<div class="sync-alert" id="syncAlert" role="status" hidden></div>
 
 <nav class="page-nav" id="pageNav" aria-label="Sections">
   <button data-page="roster" class="active">
@@ -4423,7 +4444,7 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
 <div class="modal-overlay" id="backupOverlay" hidden>
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="backupTitle">
     <div class="modal-header">
-      <h3 id="backupTitle">Backup &amp; Restore</h3>
+      <h3 id="backupTitle">Backup &amp; Sync</h3>
       <button class="modal-close" id="backupCloseBtn" aria-label="Close">×</button>
     </div>
     <div class="modal-body">
@@ -4439,6 +4460,11 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
       </label>
       <button class="modal-btn-secondary" id="backupPasteBtn" type="button">Restore from pasted text</button>
       <p class="backup-warning">Restoring replaces this device's teams, games and scores with the backup.</p>
+      <label class="tm-field">
+        <span class="tm-field-label">Supabase sync key <span class="tm-field-hint" id="syncKeyState"></span></span>
+        <input type="text" id="syncKeyInput" placeholder="Paste the anon / publishable key" autocomplete="off" spellcheck="false">
+      </label>
+      <button class="modal-btn-secondary" id="syncKeySaveBtn" type="button">Save sync key &amp; reload</button>
     </div>
   </div>
 </div>
@@ -4599,12 +4625,21 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
    localStorage write to tm_teams / cardinals_* / tm_t* gets pushed to
    the pantry; on every boot the latest cloud state is pulled before
    the app renders, so any device opens to the latest teams. */
-const PANTRY_BASE = 'https://getpantry.cloud/apiv1/pantry';
-const PANTRY_BASKET = 'tm_state';
-// Default pantry — pre-shared so a fresh device opens to the same teams
-// without any setup. A user who wants their own private pantry can paste
-// a different ID into the Sync modal; that override is stored locally.
-const DEFAULT_PANTRY_ID = 'a53410b0-2cad-40be-9743-5c64695d2c2e';
+const SUPABASE_URL = 'https://cbaxdwppgeehksxtzlhf.supabase.co';
+// Publishable/anon key. Safe to ship in a public page — access is
+// governed by the row level security policies in supabase/schema.sql.
+const SUPABASE_ANON_KEY = '';
+// A key pasted into this device (Backup modal / console) wins over the
+// baked-in one, so sync can be turned on without a redeploy.
+function supaKey() {
+  try { return (localStorage.getItem('tm_supabase_key') || '').trim() || SUPABASE_ANON_KEY; }
+  catch (e) { return SUPABASE_ANON_KEY; }
+}
+function setSupabaseKey(k) {
+  if (k) localStorage.setItem('tm_supabase_key', String(k).trim());
+  else localStorage.removeItem('tm_supabase_key');
+  location.reload();
+}
 const SYNC_PREFIXES = ['tm_teams', 'cardinals_', 'tm_t', 'game_', 'tm_updates'];
 // Cleanup-only / per-device UI state keys that match a sync prefix but
 // don't represent shareable data. Writes to these (e.g. boot-time
@@ -4647,156 +4682,224 @@ function bumpUpdated(key) {
   u[key] = Date.now();
   _rawSet('tm_updates', JSON.stringify(u));
 }
-function getPantryId() {
-  const override = (localStorage.getItem('tm_pantry_id') || '').trim();
-  return override || DEFAULT_PANTRY_ID;
+function supaReady() { return !!(SUPABASE_URL && supaKey()); }
+function supaHeaders(extra) {
+  return Object.assign({
+    apikey: supaKey(),
+    Authorization: 'Bearer ' + supaKey(),
+    'Content-Type': 'application/json'
+  }, extra || {});
 }
-function setPantryId(id) {
-  if (id) localStorage.setItem('tm_pantry_id', id.trim());
-  else localStorage.removeItem('tm_pantry_id');
+async function supaFetch(path, opts) {
+  opts = opts || {};
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method: opts.method || 'GET',
+    headers: supaHeaders(opts.headers),
+    body: opts.body,
+    cache: 'no-store',
+    keepalive: !!opts.keepalive
+  });
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 200)}`);
+  return r;
 }
-function pantryUrl() {
-  const id = getPantryId();
-  return id ? `${PANTRY_BASE}/${id}/basket/${PANTRY_BASKET}` : null;
+// Team 1 keeps the bare `cardinals_*` keys; every other team is
+// namespaced. Mirrors tk(), but for an arbitrary team rather than the
+// one currently open.
+function teamKey(teamId, name) {
+  return Number(teamId) === 1 ? name : `tm_t${teamId}_${name}`;
+}
+// PostgREST in-list: values are quoted so names with commas survive.
+function supaInList(values) {
+  return '(' + values.map(v => '"' + String(v).replace(/"/g, '\\"') + '"').join(',') + ')';
+}
+// Every team's games, read straight out of localStorage.
+function localTeamsAndGames() {
+  let teams = [];
+  try { teams = JSON.parse(localStorage.getItem('tm_teams') || '[]') || []; } catch (e) {}
+  const games = [];
+  teams.forEach(t => {
+    let list = [];
+    try { list = JSON.parse(localStorage.getItem(teamKey(t.id, 'cardinals_games_v1')) || '[]') || []; }
+    catch (e) {}
+    list.forEach(g => games.push({ teamId: t.id, game: g }));
+  });
+  return { teams, games };
 }
 
-// Pantry's PUT merges objects/arrays additively, which would corrupt
-// the team list on every push. To sidestep that, we serialize the
-// whole sync payload to a single string under `payload`. Pantry never
-// sees nested structure to merge.
+// The mapping between the app's localStorage keys and the Supabase
+// tables. localStorage stays the working copy so the dugout still works
+// with no signal; these two functions are the whole transport.
+
 async function cloudPull() {
-  const url = pantryUrl();
-  if (!url) return null;
+  if (!supaReady()) return null;
   try {
-    // 15-second cap — Pantry can be slow during peak load. Long enough
-    // that legitimate pulls finish; short enough that a truly broken
-    // network doesn't keep the user staring at a hidden page for too
-    // long. The safety timer in bootRouter is 16s, so this fits.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    // cache: 'no-store' + no-cache headers so we always hit the live Pantry
-    // basket. Without this, a CDN / browser HTTP cache can return a stale
-    // snapshot that papers over a fresh edit on another device.
-    const r = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
-      signal: controller.signal,
-      cache: 'no-store'
+    const [teams, games, stats, appState] = await Promise.all([
+      supaFetch('teams?select=*').then(r => r.json()),
+      supaFetch('games?select=*').then(r => r.json()),
+      supaFetch('player_stats?select=*').then(r => r.json()),
+      supaFetch('app_state?select=*').then(r => r.json())
+    ]);
+    if (!Array.isArray(teams)) return null;
+
+    const tmTeams = teams.map(t => ({
+      id: t.id,
+      name: t.name,
+      sport: t.sport || undefined,
+      league: t.league || undefined,
+      season: t.season || undefined,
+      color: t.color || undefined,
+      background: t.background || undefined,
+      logo: t.logo || undefined,
+      innings: t.innings,
+      positions: t.positions || undefined,
+      sponsor: t.sponsor || undefined,
+      sponsorUrl: t.sponsor_url || undefined,
+      sponsorSlogan: t.sponsor_slogan || undefined,
+      sponsorEmoji: t.sponsor_emoji || undefined,
+      updatedAt: t.updated_at ? Date.parse(t.updated_at) : 0
+    })).sort((a, b) => a.id - b.id);
+    _rawSet('tm_teams', JSON.stringify(tmTeams));
+
+    teams.forEach(t => {
+      _rawSet(teamKey(t.id, 'cardinals_roster_v2'), JSON.stringify(t.roster || []));
+      _rawSet(teamKey(t.id, 'cardinals_premium_caps_v1'), JSON.stringify(t.premium_caps || {}));
+      const mine = games
+        .filter(g => String(g.team_id) === String(t.id))
+        .map(g => ({
+          id: g.id,
+          date: g.date,
+          opponent: g.opponent,
+          notes: g.notes,
+          innings: g.innings,
+          colors: g.colors,
+          completedAt: g.completed_at ? Date.parse(g.completed_at) : null,
+          forcedActive: !!g.forced_active,
+          createdAt: g.created_at ? Date.parse(g.created_at) : 0
+        }));
+      _rawSet(teamKey(t.id, 'cardinals_games_v1'), JSON.stringify(mine));
     });
-    clearTimeout(timeout);
-    if (r.status === 400 || r.status === 404) return null;
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const wrap = await r.json();
-    if (!wrap || typeof wrap !== 'object' || typeof wrap.payload !== 'string') return null;
-    let data;
-    try { data = JSON.parse(wrap.payload); } catch (e) { return null; }
-    if (data && typeof data === 'object') {
-      // Per-key conflict resolution: cloud wins only if its tm_updates
-      // timestamp for that key is strictly newer than ours. This is the
-      // safety net for "I just changed it and the next pull is about to
-      // erase it" — if the push hasn't completed, local stays.
-      // Pantry has been seen storing values as JSON strings rather than
-      // parsed objects (legacy / first-push artifact). Accept either —
-      // try-parse a string before falling back to {}.
-      let cloudUpdates = {};
-      if (data.tm_updates) {
-        if (typeof data.tm_updates === 'object') {
-          cloudUpdates = data.tm_updates;
-        } else if (typeof data.tm_updates === 'string') {
-          try { cloudUpdates = JSON.parse(data.tm_updates) || {}; } catch (e) {}
-        }
+
+    games.forEach(g => {
+      _rawSet(teamKey(g.team_id, `game_${g.id}_present`), JSON.stringify(g.present || []));
+      _rawSet(teamKey(g.team_id, `game_${g.id}_manual_rotation`), JSON.stringify(g.manual_rotation || {}));
+      _rawSet(teamKey(g.team_id, `game_${g.id}_rotation_salt`), JSON.stringify(g.rotation_salt || 0));
+      const sc = {};
+      stats.filter(s => String(s.game_id) === String(g.id)).forEach(s => {
+        sc[s.player] = { outs: s.outs || 0, assists: s.assists || 0 };
+      });
+      _rawSet(teamKey(g.team_id, `game_${g.id}_scorecard`), JSON.stringify(sc));
+    });
+
+    (Array.isArray(appState) ? appState : []).forEach(row => {
+      const m = /^current_game_(\d+)$/.exec(row.key || '');
+      if (m && row.value != null) {
+        _rawSet(teamKey(m[1], 'cardinals_current_game_id'), String(row.value));
       }
-      const localUpdates = loadUpdates();
-      for (const [k, v] of Object.entries(data)) {
-        if (!shouldSyncKey(k)) continue;
-        if (k === 'tm_updates') continue; // handled separately below
-        const cloudAt = (typeof cloudUpdates[k] === 'number') ? cloudUpdates[k] : 0;
-        const localAt = (typeof localUpdates[k] === 'number') ? localUpdates[k] : 0;
-        try {
-          if (k === 'tm_teams' && Array.isArray(v)) {
-            // tm_teams keeps its per-team merge — finer-grained than the
-            // sidecar timestamp, so a single team edit doesn't have to
-            // block edits to a sibling team on another device.
-            const localTeams = JSON.parse(localStorage.getItem('tm_teams') || '[]');
-            const byId = new Map();
-            for (const t of (Array.isArray(localTeams) ? localTeams : [])) {
-              if (t && typeof t === 'object' && typeof t.id === 'number') byId.set(t.id, t);
-            }
-            for (const ct of v) {
-              if (!ct || typeof ct !== 'object' || typeof ct.id !== 'number') continue;
-              const lt = byId.get(ct.id);
-              if (!lt) { byId.set(ct.id, ct); continue; }
-              const ltAt = (typeof lt.updatedAt === 'number') ? lt.updatedAt : 0;
-              const ctAt = (typeof ct.updatedAt === 'number') ? ct.updatedAt : 0;
-              if (ctAt > ltAt) byId.set(ct.id, ct);
-            }
-            const merged = [...byId.values()].sort((a, b) => a.id - b.id);
-            _rawSet('tm_teams', JSON.stringify(merged));
-          } else {
-            // Every other sync key: cloud wins when it's at least as new
-            // as local. (>= handles fresh devices where both timestamps
-            // are 0 — without that, the very first pull wouldn't seed the
-            // local store from cloud.) _rawSet bypasses the wrapper so
-            // this write doesn't falsely bump our local timestamp to
-            // "now" — we want to inherit the cloud's timestamp.
-            if (cloudAt >= localAt) {
-              _rawSet(k, typeof v === 'string' ? v : JSON.stringify(v));
-            }
-          }
-        } catch (e) { console.warn('[cloudPull] storage write failed for', k, e); }
-      }
-      // Merge timestamps: take the max per key. The result is our new
-      // record of "when was each key last meaningfully touched anywhere"
-      // — the answer the next pull will compare against.
-      const mergedUpdates = Object.assign({}, localUpdates);
-      for (const k of Object.keys(cloudUpdates)) {
-        if ((cloudUpdates[k] || 0) > (mergedUpdates[k] || 0)) mergedUpdates[k] = cloudUpdates[k];
-      }
-      _rawSet('tm_updates', JSON.stringify(mergedUpdates));
-    }
-    return data;
+    });
+
+    setSyncStatus('saved');
+    return { teams, games };
   } catch (err) {
     console.warn('[cloudPull] failed:', err);
+    setSyncStatus('failed');
     return null;
   }
 }
 
 async function doCloudPush() {
-  const url = pantryUrl();
-  if (!url) return;
-  const payload = {};
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (!k || !shouldSyncKey(k)) continue;
-    try { payload[k] = JSON.parse(localStorage.getItem(k)); }
-    catch (e) { payload[k] = localStorage.getItem(k); }
-  }
-  // Never replace a populated cloud basket with an empty local
-  // snapshot. This single check handles every dangerous case:
-  //   - fresh device whose pull hasn't landed yet
-  //   - user wiped their browser
-  //   - pull errored / timed out
-  // A user can't legitimately have zero teams (Cardinals is seeded),
-  // so refusing the push here is always the right call.
-  if (!payload.tm_teams || (Array.isArray(payload.tm_teams) && payload.tm_teams.length === 0)) {
-    console.warn('[cloudPush] skipped: tm_teams is empty/missing — refusing to clobber cloud');
+  if (!supaReady()) return;
+  const { teams, games } = localTeamsAndGames();
+  // An empty local snapshot must never wipe the database — a fresh
+  // device whose pull hasn't landed yet would otherwise delete
+  // everything for everyone.
+  if (!teams.length) {
+    console.warn('[cloudPush] skipped: no local teams');
     return;
   }
-  const body = JSON.stringify({ payload: JSON.stringify(payload) });
   setSyncStatus('saving');
+  const upsert = { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' } };
+  const readKey = (teamId, name, fallback) => {
+    try {
+      const raw = localStorage.getItem(teamKey(teamId, name));
+      const parsed = raw === null ? null : JSON.parse(raw);
+      return parsed === null ? fallback : parsed;
+    } catch (e) { return fallback; }
+  };
   try {
-    // Always POST — Pantry's POST overwrites the basket whole-hog,
-    // unlike PUT which deep-merges (which concatenates arrays).
-    let r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body
-    });
-    if (!r.ok && r.status !== 400) throw new Error('HTTP ' + r.status);
-    if (r.status === 400) {
-      r = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+    const teamRows = teams.map(t => ({
+      id: t.id,
+      name: t.name || 'Team',
+      sport: t.sport || null,
+      league: t.league || null,
+      season: t.season || null,
+      color: t.color || null,
+      background: t.background || null,
+      logo: t.logo || null,
+      innings: t.innings || 4,
+      positions: t.positions || [],
+      sponsor: t.sponsor || null,
+      sponsor_url: t.sponsorUrl || null,
+      sponsor_slogan: t.sponsorSlogan || null,
+      sponsor_emoji: t.sponsorEmoji || null,
+      roster: readKey(t.id, 'cardinals_roster_v2', []),
+      premium_caps: readKey(t.id, 'cardinals_premium_caps_v1', {}),
+      updated_at: new Date(t.updatedAt || Date.now()).toISOString()
+    }));
+    await supaFetch('teams?on_conflict=id', Object.assign({ body: JSON.stringify(teamRows) }, upsert));
+    // A team deleted on this device has to disappear from the database
+    // too, or the next pull resurrects it.
+    await supaFetch('teams?id=not.in.' + supaInList(teams.map(t => t.id)), { method: 'DELETE' });
+
+    const gameRows = games.map(({ teamId, game: g }) => ({
+      id: g.id,
+      team_id: teamId,
+      date: g.date,
+      opponent: g.opponent || null,
+      notes: g.notes || null,
+      innings: g.innings || null,
+      colors: g.colors || null,
+      completed_at: g.completedAt ? new Date(g.completedAt).toISOString() : null,
+      forced_active: !!g.forcedActive,
+      present: readKey(teamId, `game_${g.id}_present`, []),
+      manual_rotation: readKey(teamId, `game_${g.id}_manual_rotation`, {}),
+      rotation_salt: readKey(teamId, `game_${g.id}_rotation_salt`, 0),
+      updated_at: new Date().toISOString()
+    }));
+    if (gameRows.length) {
+      await supaFetch('games?on_conflict=id', Object.assign({ body: JSON.stringify(gameRows) }, upsert));
+      await supaFetch('games?id=not.in.' + supaInList(gameRows.map(g => g.id)), { method: 'DELETE' });
+    } else {
+      await supaFetch('games?id=gt.0', { method: 'DELETE' });
     }
+
+    const statRows = [];
+    games.forEach(({ teamId, game: g }) => {
+      const sc = readKey(teamId, `game_${g.id}_scorecard`, {});
+      Object.keys(sc).forEach(player => {
+        const ps = sc[player] || {};
+        statRows.push({
+          game_id: g.id,
+          player: player,
+          outs: ps.outs || 0,
+          assists: ps.assists || 0,
+          updated_at: new Date().toISOString()
+        });
+      });
+    });
+    if (statRows.length) {
+      await supaFetch('player_stats?on_conflict=game_id,player',
+        Object.assign({ body: JSON.stringify(statRows) }, upsert));
+    }
+
+    const stateRows = teams.map(t => {
+      const cur = localStorage.getItem(teamKey(t.id, 'cardinals_current_game_id'));
+      return cur ? { key: `current_game_${t.id}`, value: cur, updated_at: new Date().toISOString() } : null;
+    }).filter(Boolean);
+    if (stateRows.length) {
+      await supaFetch('app_state?on_conflict=key',
+        Object.assign({ body: JSON.stringify(stateRows) }, upsert));
+    }
+
     setSyncStatus('saved');
   } catch (err) {
     console.warn('[cloudPush] failed:', err);
@@ -4831,8 +4934,7 @@ function onSyncReady() {
 // save changes. cloudPullAndRefresh flips it earlier on its own path.
 setTimeout(onSyncReady, 8000);
 function cloudPush() {
-  const url = pantryUrl();
-  if (!url) return;
+  if (!supaReady()) return;
   if (!syncReady) { pushDeferred = true; return; }
   clearTimeout(pushTimer);
   // Short debounce so rapid edits (e.g. mashing the +/- on the score
@@ -4846,64 +4948,17 @@ function cloudPush() {
 // deleteTeam) so the pending data isn't lost to the unload.
 async function flushCloudPush() {
   if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
-  if (pantryUrl()) await doCloudPush();
+  if (supaReady()) await doCloudPush();
 }
 
-// Fire-and-forget push. Tries transports in order:
-//   1. navigator.sendBeacon — most reliable when the page is about to
-//      unload (iOS PWA force-close). 64 KB body cap; returns false if
-//      too big.
-//   2. fetch + keepalive — also 64 KB cap, but gives us a Promise so
-//      the status indicator gets feedback. Used only when sendBeacon
-//      can't queue OR when we're not navigating away (the common case
-//      during live scoring).
-//   3. Regular fetch — no size limit, no unload survival. The last-
-//      resort fallback when the payload is too big for keepalive,
-//      typical when the user has team logos uploaded (base64 images
-//      blow well past 64 KB).
+// Fire-and-forget push used on page-hide and after a score tap.
+// sendBeacon can't carry the Supabase auth headers, so this is just a
+// normal push; doCloudPush already reports status.
 function cloudBeacon() {
-  const url = pantryUrl();
-  if (!url) return false;
+  if (!supaReady()) return false;
   if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
-  const payload = {};
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (!k || !shouldSyncKey(k)) continue;
-    try { payload[k] = JSON.parse(localStorage.getItem(k)); }
-    catch (e) { payload[k] = localStorage.getItem(k); }
-  }
-  if (!payload.tm_teams || (Array.isArray(payload.tm_teams) && payload.tm_teams.length === 0)) return false;
-  const body = JSON.stringify({ payload: JSON.stringify(payload) });
-  // Mark the timestamp so the next page boot skips its cloudPull and
-  // trusts local data — otherwise the pull races with delivery and can
-  // overwrite our just-saved data with stale cloud.
   try { localStorage.setItem('tm_last_push', String(Date.now())); } catch (e) {}
-  setSyncStatus('saving');
-  // 64 KB ceiling is the spec'd limit for both sendBeacon and fetch
-  // keepalive. Above that, fall straight through to a regular fetch.
-  const KEEPALIVE_MAX = 60000; // a bit under 64 KB for header overhead
-  if (body.length <= KEEPALIVE_MAX && typeof navigator !== 'undefined' && navigator.sendBeacon) {
-    try {
-      if (navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))) {
-        setSyncStatus('saved');
-        return true;
-      }
-    } catch (e) {}
-  }
-  // Regular fetch — handles arbitrarily large payloads (logos etc.). On
-  // a page-unload race this can be killed by the browser, but for a
-  // mid-game score tap it's the right answer.
-  fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body
-  }).then(r => {
-    if (r && r.ok) setSyncStatus('saved');
-    else setSyncStatus('failed');
-  }).catch((err) => {
-    console.warn('[cloudBeacon] fetch failed:', err);
-    setSyncStatus('failed');
-  });
+  doCloudPush();
   return true;
 }
 
@@ -4916,7 +4971,17 @@ function setSyncStatus(s) {
   _syncStatusAt = Date.now();
   if (typeof renderSyncStatus === 'function') renderSyncStatus();
 }
+// Silent while sync is healthy; loud the moment it isn't. The old
+// always-on "Saved" label was removed on request — but it was also the
+// only signal that a dead backend was silently swallowing every write,
+// so failure now surfaces on its own.
 function renderSyncStatus() {
+  const bar = document.getElementById('syncAlert');
+  if (bar) {
+    const broken = _syncStatus === 'failed';
+    bar.hidden = !broken;
+    if (broken) bar.textContent = "Not syncing — changes are saved on this device only. Tap to retry.";
+  }
   const el = document.getElementById('syncStatus');
   if (!el) return;
   if (_syncStatus === 'idle') { el.textContent = ''; return; }
@@ -4988,7 +5053,7 @@ function syncSnapshot() {
 let cloudPullInFlight = false;
 let lastPullAt = 0;
 async function cloudPullAndRefresh(opts) {
-  if (!getPantryId()) { onSyncReady(); return; }
+  if (!supaReady()) { onSyncReady(); return; }
   const force = !!(opts && opts.force);
   const adoptGame = !!(opts && opts.adoptGame);
   if (cloudPullInFlight) return;
@@ -6342,6 +6407,10 @@ function bindBackupUi() {
   openBtn.addEventListener('click', () => {
     document.getElementById('backupSummary').textContent = backupSummaryText();
     document.getElementById('backupPasteInput').value = '';
+    const keyInput = document.getElementById('syncKeyInput');
+    const keyState = document.getElementById('syncKeyState');
+    if (keyInput) keyInput.value = (localStorage.getItem('tm_supabase_key') || '');
+    if (keyState) keyState.textContent = supaReady() ? '(syncing)' : '(not set — local only)';
     overlay.hidden = false;
   });
   document.getElementById('backupCloseBtn')?.addEventListener('click', close);
@@ -6361,6 +6430,9 @@ function bindBackupUi() {
   document.getElementById('backupPasteBtn')?.addEventListener('click', () => {
     const text = document.getElementById('backupPasteInput').value.trim();
     if (text) restoreBackup(text);
+  });
+  document.getElementById('syncKeySaveBtn')?.addEventListener('click', () => {
+    setSupabaseKey(document.getElementById('syncKeyInput').value.trim());
   });
 }
 
@@ -6548,7 +6620,7 @@ function renderCurrentGameBanner() {
   // and window-focus, so a coach who edits the roster on the phone sees
   // it appear on the laptop (and vice versa) the moment they switch back
   // to that device, without having to refresh.
-  if (getPantryId()) cloudPullAndRefresh({ adoptGame: true });
+  if (supaReady()) cloudPullAndRefresh({ adoptGame: true });
 
   if (CURRENT_TEAM_ID === null) {
     // No ?team= → Team Manager landing
@@ -8452,6 +8524,9 @@ bindFieldingDrag();
 bindScheduleUi();
 bindBaseballCardUi();
 bindBackupUi();
+document.getElementById('syncAlert')?.addEventListener('click', () => {
+  flushCloudPush().then(() => cloudPullAndRefresh({ force: true })).catch(() => {});
+});
 bindScoreRefresh();
 renderSchedule();
 renderCurrentGameBanner();

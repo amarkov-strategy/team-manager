@@ -5,10 +5,10 @@
      index.html when online, fall back to cache when offline)
    - Static assets     → cache-first (instant loads, refreshed on
      next online visit)
-   - Pantry API calls  → bypassed entirely so syncs never get stuck
+   - Supabase API calls → bypassed entirely so syncs never get stuck
      on a stale cached response
 */
-const CACHE = 'tm-cache-v23-backup-restore';
+const CACHE = 'tm-cache-v24-supabase-sync';
 
 const PRECACHE = [
   './',
@@ -45,7 +45,7 @@ self.addEventListener('fetch', (event) => {
   try { url = new URL(req.url); } catch (e) { return; }
 
   // Never cache the sync API — needs to be live.
-  if (url.hostname === 'getpantry.cloud') return;
+  if (url.hostname.endsWith('.supabase.co')) return;
   // Cross-origin CDN fonts/icons keep their own caching headers; skip.
   if (url.origin !== self.location.origin) return;
 
