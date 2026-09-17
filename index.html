@@ -4617,14 +4617,14 @@ button, .outs-btn, .sc-btn, .cgb-action, [role="button"] {
 </div>
 
 <script>
-/* ============ Cross-device sync (Pantry) ============
-   Pantry (https://getpantry.cloud) gives us a tiny no-cost JSON
-   key/value store. Each user creates a pantry on their site (free,
-   no SQL, one email), copies their pantry ID once, and pastes it into
-   the Team Manager landing's "Set up sync" panel. After that, every
-   localStorage write to tm_teams / cardinals_* / tm_t* gets pushed to
-   the pantry; on every boot the latest cloud state is pulled before
-   the app renders, so any device opens to the latest teams. */
+/* ============ Cross-device sync (Supabase) ============
+   Postgres behind the Supabase REST API, schema in
+   supabase/schema.sql. localStorage stays the working copy so the
+   dugout works with no signal; every write to tm_teams / cardinals_* /
+   tm_t* / game_* pushes through to the database, and each boot (plus
+   tab focus and app foreground) pulls the latest back, so any device
+   opens to the same state. Replaced a free key/value store that was
+   deleted for inactivity, taking cross-device sync down silently. */
 const SUPABASE_URL = 'https://cbaxdwppgeehksxtzlhf.supabase.co';
 // Publishable/anon key. Safe to ship in a public page — access is
 // governed by the row level security policies in supabase/schema.sql.
